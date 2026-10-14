@@ -243,10 +243,44 @@ jobs:
             cat "$LEGACY_SUKISU_CONFIG"
           fi
 
+      - name: 校验 KPM 选项
+        env:
+          KPM_MODE: ${{ inputs.use_kpm }}
+          KSU_MODE_INPUT: ${{ inputs.ksu_mode }}
+          KSU_VARIANT_INPUT: ${{ inputs.ksu_variant }}
+        run: |
+          set -euo pipefail
+
+          case "$KPM_MODE" in
+            disabled*)
+              exit 0
+              ;;
+            enabled*|patched*)
+              ;;
+            *)
+              echo "::error title=无效的 KPM 选项::无法识别 KPM 模式: $KPM_MODE"
+              exit 1
+              ;;
+          esac
+
+          if [ "$KSU_MODE_INPUT" = "禁用KSU" ]; then
+            echo "::error title=KPM 配置冲突::启用 KPM 时不能选择禁用 KSU。"
+            exit 1
+          fi
+
+          case "$KSU_VARIANT_INPUT" in
+            SukiSU|SukiSU\(*\))
+              ;;
+            *)
+              echo "::error title=KPM 仅支持 SukiSU::当前选择 $KSU_VARIANT_INPUT；请将 KernelSU 变体改为 SukiSU 后再启用 KPM。"
+              exit 1
+              ;;
+          esac
+
       - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
+          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves lz4
 
       - name: 配置 ccache
         run: |
@@ -1384,13 +1418,16 @@ jobs:
             echo "CONFIG_KSU=y" >> "$DEFCONFIG"
           fi
 
-          if [ "${{ inputs.ksu_mode }}" != "禁用KSU" ] && { [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40726)" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40548)" ] || [ "${{ inputs.ksu_variant }}" == "BakaSU" ] || [ "${{ inputs.ksu_variant }}" == "Next" ]; }; then
+          if [ "${{ inputs.ksu_mode }}" != "禁用KSU" ] && [[ "${{ inputs.ksu_variant }}" == SukiSU* ]]; then
             if [[ "${{ inputs.use_kpm }}" == enabled* ]] || [[ "${{ inputs.use_kpm }}" == patched* ]]; then
               if ! grep -RqsE '^[[:space:]]*config[[:space:]]+KPM([[:space:]]|$)' common KernelSU 2>/dev/null; then
                 echo "错误: 已请求启用 KPM，但当前 KernelSU 代码未声明 CONFIG_KPM" >&2
                 exit 1
               fi
-              echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+              for cfg in KPM KALLSYMS KALLSYMS_ALL; do
+                sed -i "/^CONFIG_${cfg}=/d; /^# CONFIG_${cfg} is not set$/d" "$DEFCONFIG"
+                echo "CONFIG_${cfg}=y" >> "$DEFCONFIG"
+              done
             fi
           fi
 
@@ -1633,26 +1670,150 @@ jobs:
           retention-days: 7
           compression-level: 9
 
-      # - name: 应用 KPM 补丁 (SukiSU/BakaSU/Next)
-      #   if: startsWith(inputs.use_kpm, 'patched') && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU' || inputs.ksu_variant == 'Next')
-      #   run: |
-      #     case "${{ inputs.android_version }}" in
-      #       "android12"|"android13")
-      #         if [ "${{ inputs.kernel_version }}" != "6.6" ]; then
-      #           TARGET_PATH="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
-      #         fi
-      #         ;;
-      #       "android14"|"android15"|"android16")
-      #         TARGET_PATH="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64/"
-      #         ;;
-      #     esac
+      - name: 应用并验证 KPM 镜像补丁
+        id: patch_kpm_image
+        if: ${{ inputs.ksu_mode != '禁用KSU' && (startsWith(inputs.use_kpm, 'patched') || startsWith(inputs.use_kpm, 'enabled')) && startsWith(inputs.ksu_variant, 'SukiSU') }}
+        env:
+          ANDROID_VERSION_INPUT: ${{ inputs.android_version }}
+          KERNEL_VERSION_INPUT: ${{ inputs.kernel_version }}
+        run: |
+          set -euo pipefail
 
-      #     cp -r $SUKISU_PATCHES/kpm/patch_linux "$TARGET_PATH/patch"
-      #     cd "$TARGET_PATH"
-      #     chmod 777 patch
-      #     ./patch
-      #     rm -rf Image
-      #     mv oImage Image
+          case "$ANDROID_VERSION_INPUT" in
+            android12|android13)
+              TARGET_PATH="$KERNEL_ROOT/out/${ANDROID_VERSION_INPUT}-${KERNEL_VERSION_INPUT}/dist"
+              ;;
+            android14|android15|android16)
+              TARGET_PATH="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64"
+              ;;
+            *)
+              echo "::error title=不支持的 Android 版本::无法确定 KPM 镜像目录: $ANDROID_VERSION_INPUT"
+              exit 1
+              ;;
+          esac
+
+          IMAGE_PATH="$TARGET_PATH/Image"
+          LZ4_PATH="$TARGET_PATH/Image.lz4"
+          PATCHER="$SUKISU_PATCHES/kpm/patch_linux"
+          INSPECTOR="$SUKISU_PATCHES/kpm/kptools"
+          LOG_DIR="$GITHUB_WORKSPACE/build-logs"
+          mkdir -p "$LOG_DIR"
+
+          test -s "$IMAGE_PATH" || {
+            echo "::error title=找不到内核镜像::KPM 待修补文件不存在或为空: $IMAGE_PATH"
+            exit 1
+          }
+          test -s "$LZ4_PATH" || {
+            echo "::error title=找不到压缩内核镜像::无法为 KPM 重新生成 Image.lz4: $LZ4_PATH"
+            exit 1
+          }
+          test -s "$PATCHER" || {
+            echo "::error title=缺少 KPM 修补器::$PATCHER 不存在或为空"
+            exit 1
+          }
+          test -s "$INSPECTOR" || {
+            echo "::error title=缺少 KPM 校验器::$INSPECTOR 不存在或为空"
+            exit 1
+          }
+          chmod 0755 "$PATCHER" "$INSPECTOR"
+
+          CONFIG_VERIFIED=false
+          ACTUAL_CONFIG=""
+          for SEARCH_ROOT in "$KERNEL_ROOT/out" "$KERNEL_ROOT/bazel-out"; do
+            [ -d "$SEARCH_ROOT" ] || continue
+            while IFS= read -r CANDIDATE; do
+              if grep -qx 'CONFIG_KSU=y' "$CANDIDATE" \
+                && grep -qx 'CONFIG_KPM=y' "$CANDIDATE" \
+                && grep -qx 'CONFIG_64BIT=y' "$CANDIDATE" \
+                && grep -qx 'CONFIG_KALLSYMS=y' "$CANDIDATE" \
+                && grep -qx 'CONFIG_KALLSYMS_ALL=y' "$CANDIDATE"; then
+                ACTUAL_CONFIG="$CANDIDATE"
+                CONFIG_VERIFIED=true
+                break 2
+              fi
+            done < <(find -L "$SEARCH_ROOT" -type f -name '.config' -print 2>/dev/null | sort -u)
+          done
+
+          if [ "$CONFIG_VERIFIED" != true ] && grep -Rqs -- '-- KPM is enabled' "$LOG_DIR"; then
+            CONFIG_VERIFIED=true
+            ACTUAL_CONFIG="compile log: -- KPM is enabled"
+          fi
+
+          if [ "$CONFIG_VERIFIED" != true ]; then
+            echo "::error title=KPM 未进入最终配置::没有在实际 .config 或编译日志中确认 CONFIG_KPM=y，拒绝发布假 KPM 产物。"
+            exit 1
+          fi
+          printf '%s\n' "$ACTUAL_CONFIG" > "$LOG_DIR/kpm-config-source.txt"
+
+          TOOL_REVISION="$(git -C "$SUKISU_PATCHES" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+          printf '%s\n' "$TOOL_REVISION" > "$LOG_DIR/kpm-tool-revision.txt"
+
+          BEFORE_SHA="$(sha256sum "$IMAGE_PATH" | awk '{print $1}')"
+          rm -f "$TARGET_PATH/oImage"
+          (
+            cd "$TARGET_PATH"
+            "$PATCHER"
+          )
+
+          test -s "$TARGET_PATH/oImage" || {
+            echo "::error title=KPM 修补失败::patch_linux 没有生成有效的 oImage。"
+            exit 1
+          }
+          AFTER_SHA="$(sha256sum "$TARGET_PATH/oImage" | awk '{print $1}')"
+          if [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+            echo "::error title=KPM 修补无效::oImage 与原 Image 完全相同。"
+            exit 1
+          fi
+
+          "$INSPECTOR" -l -i "$TARGET_PATH/oImage" 2>&1 | tee "$LOG_DIR/kpm-patch-info.txt"
+          if ! grep -Eq '^[[:space:]]*patched[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$LOG_DIR/kpm-patch-info.txt"; then
+            echo "::error title=KPM 注入校验失败::kptools 未报告 patched=true。"
+            exit 1
+          fi
+
+          mv -f "$TARGET_PATH/oImage" "$IMAGE_PATH"
+          FINAL_SHA="$(sha256sum "$IMAGE_PATH" | awk '{print $1}')"
+          if [ "$FINAL_SHA" != "$AFTER_SHA" ]; then
+            echo "::error title=KPM 镜像替换失败::最终 Image 哈希与已验证的 oImage 不一致。"
+            exit 1
+          fi
+
+          ORIGINAL_LZ4_MAGIC="$(od -An -tx1 -N4 "$LZ4_PATH" | tr -d '[:space:]')"
+          case "$ORIGINAL_LZ4_MAGIC" in
+            02214c18)
+              lz4 -l -12 -f "$IMAGE_PATH" "$LZ4_PATH"
+              ;;
+            04224d18)
+              lz4 -12 -f "$IMAGE_PATH" "$LZ4_PATH"
+              ;;
+            *)
+              echo "::warning title=未知 Image.lz4 格式::原文件 magic=$ORIGINAL_LZ4_MAGIC，使用 Android 常见 legacy LZ4 格式重新压缩。"
+              lz4 -l -12 -f "$IMAGE_PATH" "$LZ4_PATH"
+              ;;
+          esac
+
+          LZ4_SHA="$(lz4 -d -c "$LZ4_PATH" | sha256sum | awk '{print $1}')"
+          if [ "$LZ4_SHA" != "$FINAL_SHA" ]; then
+            echo "::error title=KPM LZ4 校验失败::重新压缩的 Image.lz4 解压后与 KPM Image 不一致。"
+            exit 1
+          fi
+
+          {
+            echo "before=$BEFORE_SHA"
+            echo "patched=$FINAL_SHA"
+            echo "image_lz4_decoded=$LZ4_SHA"
+          } | tee "$LOG_DIR/kpm-hashes.txt"
+          echo "KPM_IMAGE_SHA256=$FINAL_SHA" >> "$GITHUB_ENV"
+
+      - name: 上传 KPM 修补失败日志
+        if: ${{ always() && steps.patch_kpm_image.outcome == 'failure' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-KPM-Logs
+          path: build-logs/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 9
 
       - name: 准备 Boot 镜像
         run: |
@@ -1682,6 +1843,72 @@ jobs:
         if: inputs.artifact_upload_mode != '上传全部'
         run: |
           mv ./Image "$ANYKERNEL3/Image"
+
+      - name: 验证 KPM 刷入产物
+        id: verify_kpm_artifacts
+        if: ${{ inputs.ksu_mode != '禁用KSU' && (startsWith(inputs.use_kpm, 'patched') || startsWith(inputs.use_kpm, 'enabled')) }}
+        env:
+          ARTIFACT_UPLOAD_MODE: ${{ inputs.artifact_upload_mode }}
+          ANDROID_VERSION_INPUT: ${{ inputs.android_version }}
+          KERNEL_VERSION_INPUT: ${{ inputs.kernel_version }}
+          SUB_LEVEL_INPUT: ${{ inputs.sub_level }}
+          OS_PATCH_LEVEL_INPUT: ${{ inputs.os_patch_level }}
+        run: |
+          set -euo pipefail
+
+          verify_hash() {
+            local file="$1" label="$2" actual
+            test -s "$file" || {
+              echo "::error title=KPM 产物缺失::$label 不存在或为空: $file"
+              return 1
+            }
+            actual="$(sha256sum "$file" | awk '{print $1}')"
+            if [ "$actual" != "$KPM_IMAGE_SHA256" ]; then
+              echo "::error title=KPM 产物哈希错误::$label 没有使用已验证的 KPM Image。"
+              return 1
+            fi
+          }
+
+          verify_hash "$ANYKERNEL3/Image" "AnyKernel3/Image"
+          verify_hash "$GITHUB_WORKSPACE/bootimgs/Image" "bootimgs/Image"
+
+          "$SUKISU_PATCHES/kpm/kptools" -l -i "$ANYKERNEL3/Image" 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-logs/kpm-final-image-info.txt"
+          grep -Eq '^[[:space:]]*patched[[:space:]]*=[[:space:]]*true[[:space:]]*$' \
+            "$GITHUB_WORKSPACE/build-logs/kpm-final-image-info.txt" || {
+              echo "::error title=最终 KPM 镜像校验失败::AnyKernel3/Image 未报告 patched=true。"
+              exit 1
+            }
+
+          LZ4_SHA="$(lz4 -d -c "$GITHUB_WORKSPACE/bootimgs/Image.lz4" | sha256sum | awk '{print $1}')"
+          if [ "$LZ4_SHA" != "$KPM_IMAGE_SHA256" ]; then
+            echo "::error title=最终 KPM LZ4 校验失败::bootimgs/Image.lz4 解压后不是已验证的 KPM Image。"
+            exit 1
+          fi
+
+          if [ "$ARTIFACT_UPLOAD_MODE" = "上传全部" ]; then
+            ZIP_PATH="$GITHUB_WORKSPACE/${ANDROID_VERSION_INPUT}-${KERNEL_VERSION_INPUT}.${SUB_LEVEL_INPUT}-${OS_PATCH_LEVEL_INPUT}-AnyKernel3.zip"
+            test -s "$ZIP_PATH" || {
+              echo "::error title=AnyKernel3 压缩包缺失::$ZIP_PATH 不存在或为空。"
+              exit 1
+            }
+            ZIP_SHA="$(unzip -p "$ZIP_PATH" Image | sha256sum | awk '{print $1}')"
+            if [ "$ZIP_SHA" != "$KPM_IMAGE_SHA256" ]; then
+              echo "::error title=AnyKernel3 压缩包校验失败::ZIP 内的 Image 不是已验证的 KPM Image。"
+              exit 1
+            fi
+          fi
+
+      - name: 上传 KPM 验证记录
+        if: ${{ always() && steps.patch_kpm_image.outcome == 'success' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-KPM-Verification
+          path: |
+            build-logs/kpm-*.txt
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9
 
       - name: 构建 Boot 镜像 (Android 12)
         if: inputs.android_version == 'android12'
